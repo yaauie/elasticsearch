@@ -44,6 +44,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import static org.elasticsearch.ingest.ConfigurationUtils.newConfigurationException;
@@ -412,11 +413,44 @@ public final class GeoIpProcessor extends AbstractProcessor {
         );
 
         private final GeoIpDatabaseProvider geoIpDatabaseProvider;
-        private final ClusterService clusterService;
+        private final Predicate<String> isDatabaseValid;
 
         public Factory(GeoIpDatabaseProvider geoIpDatabaseProvider, ClusterService clusterService) {
+            this(geoIpDatabaseProvider, databaseValidator(clusterService));
+        }
+
+        public Factory(GeoIpDatabaseProvider geoIpDatabaseProvider, Predicate<String> isDatabaseValid) {
             this.geoIpDatabaseProvider = geoIpDatabaseProvider;
-            this.clusterService = clusterService;
+            this.isDatabaseValid = isDatabaseValid;
+        }
+
+        private static Predicate<String> databaseValidator(final ClusterService clusterService) {
+            return (databaseFile) -> {
+                ClusterState currentState = clusterService.state();
+                assert currentState != null;
+
+                PersistentTask<?> task = getTaskWithId(currentState, GeoIpDownloader.GEOIP_DOWNLOADER);
+                if (task == null || task.getState() == null) {
+                    return true;
+                }
+                GeoIpTaskState state = (GeoIpTaskState) task.getState();
+                GeoIpTaskState.Metadata metadata = state.getDatabases().get(databaseFile);
+                // we never remove metadata from cluster state, if metadata is null we deal with built-in database, which is always valid
+                if (metadata == null) {
+                    return true;
+                }
+
+                boolean valid = metadata.isValid(currentState.metadata().settings());
+                if (valid && metadata.isCloseToExpiration()) {
+                    HeaderWarning.addWarning(
+                        "database [{}] was not updated for over 25 days, geoip processor"
+                            + " will stop working if there is no update for 30 days",
+                        databaseFile
+                    );
+                }
+
+                return valid;
+            };
         }
 
         @Override
@@ -480,32 +514,8 @@ public final class GeoIpProcessor extends AbstractProcessor {
                 }
             }
             DatabaseVerifyingSupplier supplier = new DatabaseVerifyingSupplier(geoIpDatabaseProvider, databaseFile, databaseType);
-            Supplier<Boolean> isValid = () -> {
-                ClusterState currentState = clusterService.state();
-                assert currentState != null;
+            Supplier<Boolean> isValid = () -> isDatabaseValid.test(databaseFile);
 
-                PersistentTask<?> task = getTaskWithId(currentState, GeoIpDownloader.GEOIP_DOWNLOADER);
-                if (task == null || task.getState() == null) {
-                    return true;
-                }
-                GeoIpTaskState state = (GeoIpTaskState) task.getState();
-                GeoIpTaskState.Metadata metadata = state.getDatabases().get(databaseFile);
-                // we never remove metadata from cluster state, if metadata is null we deal with built-in database, which is always valid
-                if (metadata == null) {
-                    return true;
-                }
-
-                boolean valid = metadata.isValid(currentState.metadata().settings());
-                if (valid && metadata.isCloseToExpiration()) {
-                    HeaderWarning.addWarning(
-                        "database [{}] was not updated for over 25 days, geoip processor"
-                            + " will stop working if there is no update for 30 days",
-                        databaseFile
-                    );
-                }
-
-                return valid;
-            };
             return new GeoIpProcessor(
                 processorTag,
                 description,
